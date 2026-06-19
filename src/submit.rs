@@ -56,6 +56,7 @@ pub struct Submitter<'a> {
     sq_head: *const atomic::AtomicU32,
     sq_tail: *const atomic::AtomicU32,
     sq_flags: *const atomic::AtomicU32,
+    ring_fd_registered: Option<u32>,
 }
 
 impl<'a> Submitter<'a> {
@@ -66,6 +67,7 @@ impl<'a> Submitter<'a> {
         sq_head: *const atomic::AtomicU32,
         sq_tail: *const atomic::AtomicU32,
         sq_flags: *const atomic::AtomicU32,
+        ring_fd_registered: Option<u32>,
     ) -> Submitter<'a> {
         Submitter {
             fd,
@@ -73,6 +75,7 @@ impl<'a> Submitter<'a> {
             sq_head,
             sq_tail,
             sq_flags,
+            ring_fd_registered,
         }
     }
 
@@ -124,11 +127,15 @@ impl<'a> Submitter<'a> {
             .map(|arg| cast_ptr(arg).cast())
             .unwrap_or_else(ptr::null);
         let size = mem::size_of::<T>();
+        let (enter_fd, enter_flags) = match self.ring_fd_registered {
+            Some(idx) => (idx as RawFd, flag | EnterFlags::REGISTERED_RING.bits()),
+            None => (self.fd.as_raw_fd(), flag),
+        };
         sys::io_uring_enter(
-            self.fd.as_raw_fd(),
+            enter_fd,
             to_submit,
             min_complete,
-            flag,
+            enter_flags,
             arg,
             size,
         )
@@ -736,6 +743,53 @@ impl<'a> Submitter<'a> {
             self.fd.as_raw_fd(),
             sys::IORING_REGISTER_SYNC_CANCEL,
             cast_ptr::<sys::io_uring_sync_cancel_reg>(&arg).cast(),
+            1,
+        )
+        .map(drop)
+    }
+
+    /// Register the ring file descriptor for use with
+    /// `IORING_ENTER_REGISTERED_RING`. Returns the registered index.
+    ///
+    /// Prefer [`IoUring::register_ring_fd`] which stores the index and
+    /// automatically uses it for all subsequent submissions.
+    ///
+    /// Available since 5.18.
+    pub fn register_ring_fd(&self) -> io::Result<u32> {
+        let mut reg = sys::io_uring_rsrc_update {
+            offset: u32::MAX,
+            resv: 0,
+            data: self.fd.as_raw_fd() as u64,
+        };
+
+        let ret = execute(
+            self.fd.as_raw_fd(),
+            sys::IORING_REGISTER_RING_FDS,
+            (&mut reg as *mut sys::io_uring_rsrc_update).cast(),
+            1,
+        )?;
+
+        if ret == 1 {
+            Ok(reg.offset)
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        }
+    }
+
+    /// Unregister a previously registered ring file descriptor.
+    ///
+    /// Available since 5.18.
+    pub fn unregister_ring_fd(&self, offset: u32) -> io::Result<()> {
+        let reg = sys::io_uring_rsrc_update {
+            offset,
+            resv: 0,
+            data: 0,
+        };
+
+        execute(
+            self.fd.as_raw_fd(),
+            sys::IORING_UNREGISTER_RING_FDS,
+            (&reg as *const sys::io_uring_rsrc_update).cast(),
             1,
         )
         .map(drop)

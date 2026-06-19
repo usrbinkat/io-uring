@@ -84,6 +84,7 @@ where
     fd: OwnedFd,
     params: Parameters,
     memory: ManuallyDrop<MemoryMap>,
+    ring_fd_registered: Option<u32>,
 }
 
 #[allow(dead_code)]
@@ -217,6 +218,7 @@ impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> IoUring<S, C> {
             fd,
             params: Parameters(p),
             memory: ManuallyDrop::new(mm),
+            ring_fd_registered: None,
         })
     }
 
@@ -230,6 +232,7 @@ impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> IoUring<S, C> {
             self.sq.head,
             self.sq.tail,
             self.sq.flags,
+            self.ring_fd_registered,
         )
     }
 
@@ -252,6 +255,30 @@ impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> IoUring<S, C> {
         self.submitter().submit_and_wait(want)
     }
 
+    /// Register the ring file descriptor for use with
+    /// `IORING_ENTER_REGISTERED_RING`, eliminating the fd table lookup
+    /// on every `io_uring_enter(2)` syscall. After this call, all
+    /// subsequent `submit`, `submit_and_wait`, and `submit_with_args`
+    /// calls automatically use the registered ring fd. Available since 5.18.
+    pub fn register_ring_fd(&mut self) -> io::Result<u32> {
+        if self.ring_fd_registered.is_some() {
+            return Err(io::Error::from_raw_os_error(libc::EEXIST));
+        }
+        let idx = self.submitter().register_ring_fd()?;
+        self.ring_fd_registered = Some(idx);
+        Ok(idx)
+    }
+
+    /// Unregister a previously registered ring file descriptor. After
+    /// this call, subsequent submissions revert to the normal fd path.
+    pub fn unregister_ring_fd(&mut self) -> io::Result<()> {
+        if let Some(idx) = self.ring_fd_registered.take() {
+            self.submitter().unregister_ring_fd(idx)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Get the submitter, submission queue and completion queue of the io_uring instance. This can
     /// be used to operate on the different parts of the io_uring instance independently.
     ///
@@ -272,6 +299,7 @@ impl<S: squeue::EntryMarker, C: cqueue::EntryMarker> IoUring<S, C> {
             self.sq.head,
             self.sq.tail,
             self.sq.flags,
+            self.ring_fd_registered,
         );
         (submit, self.sq.borrow(), self.cq.borrow())
     }
@@ -638,6 +666,12 @@ impl Parameters {
         self.0.features & sys::IORING_FEAT_LINKED_FILE != 0
     }
 
+    /// Whether the kernel supports registering the ring fd via
+    /// `IORING_REGISTER_RING_FDS`. Available since kernel 5.18.
+    pub fn is_feature_reg_reg_ring(&self) -> bool {
+        self.0.features & sys::IORING_FEAT_REG_REG_RING != 0
+    }
+
     /// Whether the kernel supports `IORING_RECVSEND_BUNDLE`.
     ///
     /// This feature allows sending and recieving multiple buffers as a single bundle. Available
@@ -685,6 +719,7 @@ impl std::fmt::Debug for Parameters {
                 &self.is_feature_cur_personality(),
             )
             .field("is_feature_poll_32bits", &self.is_feature_poll_32bits())
+            .field("is_feature_reg_reg_ring", &self.is_feature_reg_reg_ring())
             .field("sq_entries", &self.0.sq_entries)
             .field("cq_entries", &self.0.cq_entries)
             .finish()
